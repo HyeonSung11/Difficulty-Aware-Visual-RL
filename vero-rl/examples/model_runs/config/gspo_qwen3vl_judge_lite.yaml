@@ -1,0 +1,162 @@
+# Judge-ON variant of the lite 2x4090 config (standalone; mirrors gspo_qwen3vl_lite
+# but inherits gspo_llmjudge_shared directly to avoid the hydra.searchpath conflict
+# that arises when a non-primary config sets searchpath).
+# Carries every memory/LoRA fix proven in the judge-off smoke test and flips on
+# the real LLM judge while trimming the time-sink validation.
+defaults:
+  - gspo_llmjudge_shared
+  - _self_
+
+hydra:
+  searchpath:
+    - file://${oc.env:REPO_ROOT}/verl/trainer/config
+
+data:
+  per_batch_domain_weights: null   # Vero-600k `ability` labels don't match the 6 category weights
+  # Concise variant: the paper's prompt elicits 1576-1983 word CoT which overflows
+  # the 2x4090 response budget (truncation -> R_fmt=0 -> reward floor). This keeps
+  # the required <think>/<answer>/\boxed{} structure but asks for brief reasoning so
+  # the answer fits in budget. NOTE: deviates from Vero (paper p13: terse prompts
+  # hurt quality) -- used only to get a learning signal on constrained hardware.
+  system_prompt: "${oc.env:REPO_ROOT}/examples/prompts/system_prompt_concise.txt"
+  max_pixels: 262144              # ~1024x1024
+  # 2048 -> 1024: the log_prob forward's [packed_tokens, vocab] logits tensor is
+  # what OOMed the actor at the 24GB edge, and it scales with the longest packed
+  # sequence (max_prompt + max_response). Capping the prompt at 1024 (+768 resp =
+  # 1792 max seq) shrinks that tensor enough to fit alongside the resident 8GB
+  # policy + ~12GB vLLM rollout pool. max_prompt IS in the overlong-filter cache
+  # key, so this triggers a one-time ~2h re-filter; long-image samples get dropped.
+  max_prompt_length: 512
+  # 768 truncated the CoT before the model could emit its \boxed{} answer ->
+  # 91% of steps scored the -1.0 floor with zero GRPO signal. 1024 fits free:
+  # max_prompt(1024)+max_response(1024)=2048 == the token budget, and the
+  # log_prob micro-batch already packs to 2048, so peak memory is unchanged.
+  max_response_length: 1536
+  train_batch_size: 4
+  val_batch_size: 4
+  filter_overlong_prompts: true
+  truncation: right
+  # ---- 커리큘럼 러닝: 난이도 tier 동적 가중(p(1-p)) 샘플러 ----
+  # train_files는 tier 태그(extra_info.difficulty_tier) 붙은 curriculum 데이터로.
+  train_files: "${oc.env:TRAIN_FILES,./data/vero-600k/vero_600k_train.curriculum.jsonl}"
+  dataloader_num_workers: 0          # 커리큘럼 샘플러 필수 (캐싱 방지)
+  sampler:
+    class_path: pkg://verl/experimental/dataset/curriculum_tier_sampler
+    class_name: CurriculumTierSampler
+  curriculum:
+    update_every: 200                # K step마다 tier 무게 재계산
+    easy_floor: 0.02                 # easy 퇴행 감시용 최소 무게
+    min_unsolved: 1                  # [프론티어 실험] 배치(4)마다 unsolved 최소 2개 강제
+    init_weights:
+      easy: 0.05
+      medium: 0.75
+      hard: 0.20
+      unsolved: 0.0
+
+actor_rollout_ref:
+  model:
+    path: "Qwen/Qwen3-VL-8B-Instruct"
+    lora_rank: 32
+    lora_alpha: 64
+    target_modules: all-linear
+    exclude_modules: ".*visual.*"   # vLLM applies LoRA to language model only
+  actor:
+    ppo_mini_batch_size: 4
+    ppo_max_token_len_per_gpu: 2048
+    optim:
+      # Inherited lr (1e-6) is tuned for full-param RL; LoRA adapters barely move
+      # at that rate. 1e-5 is a standard LoRA learning rate.
+      lr: 1e-5
+    fsdp_config:
+      model_dtype: bfloat16         # actor defaults to fp32 otherwise -> 2x memory
+      param_offload: false
+      optimizer_offload: false
+    freeze_vision_tower: true
+    ulysses_sequence_parallel_size: 1   # Qwen3-VL deepstack incompatible with Ulysses SP
+  rollout:
+    tensor_model_parallel_size: 2
+    # [4090-fix] Load the base model into vLLM FROM DISK instead of the default
+    # "dummy" (random init + FSDP->vLLM weight sync). The FSDP->vLLM base sync was
+    # proven BROKEN for Qwen3-VL: base loaded from disk in vLLM answers correctly
+    # (\boxed{} valid, 3/3), but the dummy+synced weights produce degenerate
+    # <tool_call>/newline junk (0/64 valid format) -> reward never leaves the floor.
+    # Since the base is frozen (LoRA training), the disk base == the training base,
+    # so loading from disk is exact. Only the LoRA adapter is hot-swapped each step
+    # via add_lora (that path is correct). base_sync_done becomes True at init, so
+    # the broken base sync is never invoked. Combined with VERL_VLLM_SLEEP_LEVEL=1
+    # (base preserved in CPU across sleeps, no per-step disk reload).
+    load_format: auto
+    # 0.5 is fine again now that the prompt cap (1024) shrank the actor's log_prob
+    # footprint: 8GB policy + 12GB rollout pool + ~0.9GB logits now fits under 24GB.
+    # max_num_batched_tokens must be >= max_model_len (1024+768=1792).
+    gpu_memory_utilization: 0.5
+    max_num_batched_tokens: 2048
+    enforce_eager: true
+    enable_prefix_caching: false
+    # [n=4] GSPO/GRPO computes the advantage as a baseline over the n samples of
+    # the SAME prompt. n=2 is the minimum group -> very noisy advantage. n=4 gives
+    # a much more stable group baseline (better learning) for ~2x rollout time.
+    # VRAM-safe: responses are now short (~50 tok) and the actor uses token-budget
+    # micro-batching (*_max_token_len_per_gpu=2048), so more samples add micro-batch
+    # iterations (time), not peak memory. Total response tokens/step stay far below
+    # the (working) garbage-era run that maxed responses at 1536 tokens.
+    n: 4
+    # 1.0 -> 0.6: at temp 1.0 the model rambles past the 1024 response cap and
+    # gets truncated before emitting \boxed{} (reward floors at -1.0). Lower temp
+    # produces shorter, more focused generations that reach the answer in budget.
+    temperature: 0.6
+    log_prob_max_token_len_per_gpu: 2048
+  ref:
+    log_prob_max_token_len_per_gpu: 2048
+    fsdp_config:
+      param_offload: true
+
+critic:
+  ppo_max_token_len_per_gpu: 2048
+  forward_max_token_len_per_gpu: 2048
+
+reward_model:
+  # Real judge manager (lite used `naive` -> dummy 0.0). format_score +
+  # llm_judge_kwargs (sleep mode, localhost:51001) are inherited from
+  # gspo_llmjudge_shared; only resize the response/overlong limits for lite tokens.
+  reward_manager: vero_vllm_judge
+  forward_max_token_len_per_gpu: 2048
+  reward_kwargs:
+    max_resp_len: 1536
+    # sleep_level 1 offloads the 32B-AWQ judge weights to CPU RAM (~24GB) when
+    # asleep, which on top of the two ~41GB training workers blew past the 125GB
+    # node RAM (Ray OOM). Level 2 discards the weights instead (reloaded on wake)
+    # -> judge uses ~0 host RAM while asleep. Slower wake, but fits.
+    llm_judge_kwargs:
+      sleep_level: 2
+    overlong_buffer_cfg:
+      enable: true
+      len: 512
+      penalty_factor: 1.0
+      log: false
+
+trainer:
+  n_gpus_per_node: 2
+  # Dump each step's prompts + generated responses so we can inspect what the
+  # model actually writes in the 1536-token responses (genuine long CoT vs loop).
+  rollout_data_dir: "${oc.env:VERO_DATA,./data}/vero_runs/rollout_dumps"
+  # [paper-match] 4000 steps = the original Vero recipe's step count
+  # (gspo_llmjudge_shared: total_training_steps 4000). NOTE: our train_batch_size=4
+  # and n=4 are far smaller than the paper's 256/8, so each step sees ~64x less
+  # data; this matches the paper's STEP COUNT, not its total data (infeasible on
+  # 2x4090). At ~45s/step (n=4) -> ~50h. Checkpoints every 10 steps, stoppable.
+  # [이어서 학습] 4000 완주 후 unsolved 최소보장(min_unsolved=2) 실험으로 +2000 -> 6000.
+  # resume_mode=auto가 global_step_4000에서 이어받아 4001~6000을 추가 학습한다.
+  total_training_steps: 6000
+  # [disk-safety] Each checkpoint is ~18GB (verl saves the full FSDP model+optimizer,
+  # not just the 334MB LoRA adapter). save_freq=10 filled the 7.3T NAS (crash at
+  # step 810, torch.save iostream error). save_freq=200 + keep only the last 5
+  # actor checkpoints -> disk capped at ~90GB, crash loses <=200 steps (~5.5h).
+  save_freq: 200
+  max_actor_ckpt_to_keep: 5
+  # Keep mid-training validation off (1000-sample val generation is a ~2h sink).
+  test_freq: 1000000
+  total_epochs: 1
+  val_before_train: false
+  log_val_generations: 0
+  logger: ["console"]

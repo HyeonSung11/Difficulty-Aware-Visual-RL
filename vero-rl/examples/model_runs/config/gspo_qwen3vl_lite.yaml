@@ -1,0 +1,97 @@
+defaults:
+  - gspo_llmjudge_shared
+  - _self_
+
+hydra:
+  searchpath:
+    - file://${oc.env:REPO_ROOT}/verl/trainer/config
+
+data:
+  # Disable per-batch domain-balanced sampling for the smoke test: this Vero-600k
+  # dump's `ability` labels don't match the shared config's 6 category weights
+  # (val set matches none -> hard error). Not needed to verify the pipeline.
+  per_batch_domain_weights: null
+  max_pixels: 1048576           # ~1024x1024
+  max_prompt_length: 2048
+  max_response_length: 1024
+  train_batch_size: 4
+  val_batch_size: 4
+  filter_overlong_prompts: true
+  truncation: right
+
+actor_rollout_ref:
+  model:
+    path: "Qwen/Qwen3-VL-8B-Instruct"
+    # LoRA: train adapters only so 8B fits comfortably on 2x4090 (24GB each).
+    # verl auto-enables vLLM LoRA (enable_lora/max_lora_rank) when lora_rank > 0
+    # and syncs adapter weights to the rollout engine as tensors.
+    lora_rank: 32
+    lora_alpha: 64
+    target_modules: all-linear
+    # Exclude the vision tower from LoRA: vLLM only applies LoRA to the language
+    # model, so adapters on visual.* break the actor->vLLM weight sync
+    # (KeyError on '...qkv.base_layer.weight'). Vision tower is frozen anyway.
+    exclude_modules: ".*visual.*"
+  actor:
+    ppo_mini_batch_size: 4
+    ppo_max_token_len_per_gpu: 3072
+    fsdp_config:
+      # fsdp_workers.py loads the ACTOR in float32 unless model_dtype is set,
+      # which doubled memory (8B fp32 = 32GB -> 16GB/GPU sharded) and caused both
+      # the host-RAM OOM (when offloaded) and the GPU OOM (when resident).
+      # bf16 halves it: 16GB total -> ~8GB/GPU, leaving room for vLLM.
+      model_dtype: bfloat16
+      # With LoRA the trainable set is tiny, so keep params resident on GPU
+      # instead of offloading to CPU pinned RAM; vLLM util lowered to make room.
+      param_offload: false
+      optimizer_offload: false
+    freeze_vision_tower: true
+    # Qwen3-VL's deepstack visual-feature injection is incompatible with Ulysses
+    # sequence parallelism: the hidden states get sharded across GPUs but the
+    # deepstack visual_pos_masks do not, giving mask 2x the local seq length
+    # (IndexError: mask [1,6864] vs tensor [1,3432,...]). Disable SP; FSDP data
+    # parallelism across the 2 GPUs is unaffected.
+    ulysses_sequence_parallel_size: 1
+  rollout:
+    tensor_model_parallel_size: 2
+    # 0.4 left no room for KV cache after the TP=2 rollout weights (~8GB/GPU).
+    # With param_offload off, the actor base now stays resident on GPU (~8GB/GPU),
+    # so cap vLLM at 0.5 (~12GB): 12 + 8 = 20GB < 24GB, still leaves KV headroom.
+    gpu_memory_utilization: 0.5
+    # vLLM (chunked prefill on) requires max_num_batched_tokens >= max_model_len
+    # (= max_prompt_length 2048 + max_response_length 1024 = 3072). 2048 < 3072 errored.
+    max_num_batched_tokens: 4096
+    enforce_eager: true
+    enable_prefix_caching: false
+    n: 2
+    log_prob_max_token_len_per_gpu: 3072
+  ref:
+    log_prob_max_token_len_per_gpu: 3072
+    fsdp_config:
+      param_offload: true
+
+critic:
+  ppo_max_token_len_per_gpu: 3072
+  forward_max_token_len_per_gpu: 3072
+
+reward_model:
+  reward_manager: naive
+  forward_max_token_len_per_gpu: 3072
+  reward_kwargs:
+    overlong_buffer_cfg:
+      enable: true
+      len: 512
+      penalty_factor: 1.0
+      log: false
+    max_resp_len: 1024
+    instruction_following_reward_weight: 0.5
+
+trainer:
+  n_gpus_per_node: 2
+  total_training_steps: 10
+  save_freq: 10
+  test_freq: 10
+  total_epochs: 1
+  val_before_train: false
+  log_val_generations: 0
+  logger: ["console"]

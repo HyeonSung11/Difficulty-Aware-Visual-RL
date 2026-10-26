@@ -1,0 +1,49 @@
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- upstream Vero ignores ---
+/data/
+vero-rl/data/*
+!vero-rl/data/.gitkeep
+outputs/
+wandb/
+checkpoints/
+*.ckpt
+*.safetensors
+*.bin
+*.pt
+
+# --- logs, rollouts, evaluation outputs ---
+*.log
+_logs/
+vllm_logs/
+rollout_dumps/
+eval_results*/
+evidence_dumps/
+curriculum/*.jsonl
+curriculum/.current_*
+curriculum/.eval_log
+curriculum/.dist_data.json
+curriculum/.unsolved_exp.json
+
+# --- manuscripts / presentations / media (kept out of the code repo) ---
+papers/
+*.pptx
+*.docx
+*.hwp
+*.pdf
+*.MOV
+*.mp4
+*.bak*
+*.tex
+*.ttf
+
+# --- editors / OS ---
+.vscode/
+.idea/
+.DS_Store
