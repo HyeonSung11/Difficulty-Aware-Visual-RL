@@ -4,9 +4,6 @@
 Hyeon-Sung Choi, Jong-Eun Ha*  
 Seoul National University of Science and Technology
 
-- Submitted to *Journal of Institute of Control, Robotics and Systems* (2026)
-- Revised manuscript (2026/10) · Under review
-
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 > 🚀 This project is built on **[Vero](https://github.com/zlab-princeton/vero)** (Princeton zlab, 2026): an open RL recipe for general visual reasoning that bundles a [veRL](https://github.com/volcengine/verl) training fork (`vero-rl`) and an [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval) fork (`vero-eval`).  
